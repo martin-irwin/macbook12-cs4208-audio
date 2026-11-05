@@ -1,0 +1,303 @@
+#!/usr/bin/python3 -I
+"""cs4208-speakerd — make the MacBook10,1 internal speakers work on the stock
+snd-hda-codec-cs420x driver. The stock driver handles the headphone jack; the
+speakers sit behind an external amp on a digital link that the stock driver never
+initialises. Whenever playback is running and nothing is in the jack, replay the
+macOS-derived amp init (setup_a1534 + play_a1534 from macbook12-audio-driver).
+When headphones are plugged, restore the stock headphone path and gate the amp off.
+Requires the EFI startup chime to be un-muted (the amp is only powered at boot then)."""
+import ctypes, fcntl, glob, os, pwd, select, struct, subprocess, time
+
+DEV = '/dev/snd/hwC0D0'
+STATUS = '/proc/asound/card0/pcm0p/sub0/status'
+SHARE = '/usr/local/share/cs4208'
+IOCTL_VERB_WRITE = 0xC0084811  # _IOWR('H', 0x11, struct hda_verb_ioctl)
+NAMES = {'SET_STREAM_FORMAT': 0x200, 'SET_AMP_GAIN_MUTE': 0x300, 'SET_PROC_COEF': 0x400,
+         'SET_COEF_INDEX': 0x500, 'SET_CONNECT_SEL': 0x701, 'SET_PROC_STATE': 0x703,
+         'SET_POWER_STATE': 0x705, 'SET_CHANNEL_STREAMID': 0x706,
+         'SET_PIN_WIDGET_CONTROL': 0x707, 'SET_UNSOLICITED_ENABLE': 0x708,
+         'SET_BEEP_CONTROL': 0x70a, 'SET_DIGI_CONVERT_1': 0x70d, 'SET_DIGI_CONVERT_2': 0x70e,
+         'SET_GPIO_DATA': 0x715, 'SET_GPIO_MASK': 0x716, 'SET_GPIO_DIRECTION': 0x717}
+GET_CONV, GET_FMT, GET_SENSE = 0xf06, 0xa00, 0xf09
+
+def log(msg):
+    print(msg, flush=True)  # stdout goes to the journal
+
+def load(path):
+    out = []
+    for line in open(path):
+        p = line.split()
+        if len(p) != 3: continue
+        out.append((int(p[0], 16), NAMES[p[1]] if p[1] in NAMES else int(p[1], 16), int(p[2], 16)))
+    return out
+
+def verb(fd, nid, v, param=0):
+    buf = bytearray(struct.pack('II', (nid << 24) | (v << 8) | param, 0))
+    fcntl.ioctl(fd, IOCTL_VERB_WRITE, buf)
+    return struct.unpack('II', buf)[1]
+
+def running():
+    try:
+        return 'RUNNING' in open(STATUS).read()
+    except OSError:
+        return False
+
+LAST_TAG = 0  # stream tag of the open PCM; constant while it stays open
+
+def stream_tag(fd):
+    """The macOS headphone switch detaches converter 0x0a, so look at both converters
+    that carry the stream and remember the last tag seen. 0 means unknown."""
+    global LAST_TAG
+    for nid in (0x0a, 0x02):
+        t = verb(fd, nid, GET_CONV)
+        if t >> 4:
+            LAST_TAG = t
+            return t
+    return LAST_TAG
+
+def speakers(fd, setup, play):
+    tag = stream_tag(fd)
+    fmt = verb(fd, 0x0a, GET_FMT)
+    if fmt not in (0x4011, 0x4013):
+        log(f'warning: stream format {fmt:#x} is not S16/44.1k; speakers may stay silent')
+    t0 = time.monotonic()
+    for n, v, p in setup:
+        verb(fd, n, v, p)
+    for n, v, p in play:
+        if n == 0x0a and v == 0x706 and p:
+            p = tag
+        verb(fd, n, v, p)
+    log(f'speakers on (stream tag {tag:#x}, {len(setup)+len(play)} verbs, {1000*(time.monotonic()-t0):.0f} ms)')
+    return fmt
+
+def coef_get(fd, idx):
+    verb(fd, 0x24, 0x500, idx)
+    return verb(fd, 0x24, 0xc00)
+
+def coef_set(fd, idx, val):
+    verb(fd, 0x24, 0x500, idx)
+    verb(fd, 0x24, 0x400, val)
+
+def state(fd):
+    g = [verb(fd, 0x01, v) for v in (0xf16, 0xf17, 0xf15)]
+    return (f'gpio mask/dir/data={g[0]:#x}/{g[1]:#x}/{g[2]:#x} proc={verb(fd, 0x24, 0xf03):#x} '
+            f'coef1f={coef_get(fd, 0x1f):#x} coef33={coef_get(fd, 0x33):#x} coef34={coef_get(fd, 0x34):#x}')
+
+def headphones(fd, fmt):
+    """Restore the stock driver's headphone state (what cs_init + snd_hda_gen set up),
+    undoing the parts of the speaker init that touch the shared codec state."""
+    before = state(fd)
+    tag = verb(fd, 0x0a, GET_CONV)
+    # stock cs4208_fixup_gpio0: only GPIO0, as output; data 0 = speaker amp off
+    verb(fd, 0x01, 0x716, 0x01); verb(fd, 0x01, 0x717, 0x01); verb(fd, 0x01, 0x715, 0x00)
+    # stock cs4208_coef_init_verbs (+ coef 0x1f as read under the stock driver)
+    verb(fd, 0x24, 0x703, 0x01)
+    coef_set(fd, 0x33, 0x0001); coef_set(fd, 0x34, 0x1C01); coef_set(fd, 0x1f, 0x0400)
+    verb(fd, 0x1d, 0x707, 0x00)          # speaker pin off
+    verb(fd, 0x02, 0x705, 0x00)          # DAC on
+    verb(fd, 0x02, 0x200, fmt if fmt != 0x4013 else 0x4011)
+    verb(fd, 0x02, 0x706, tag)
+    verb(fd, 0x10, 0x705, 0x00)          # HP pin on
+    verb(fd, 0x10, 0x701, 0x00)
+    verb(fd, 0x10, 0x707, 0xc0)
+    log(f'headphones on (stream tag {tag:#x}); before: {before}; after: {state(fd)}')
+
+def load_hp(path):
+    out = []
+    for line in open(path):
+        p = line.split()
+        if len(p) != 3: continue
+        if p[0] == 'COEF':
+            out.append(('coef', int(p[1], 16), int(p[2], 16)))
+        else:
+            out.append(('verb', int(p[0], 16), NAMES[p[1]] if p[1] in NAMES else int(p[1], 16), int(p[2], 16)))
+    return out
+
+def headphones_macos(fd, hp, fmt):
+    """Switch speaker->headphones the way macOS does (headphones_a1534 trace), with the
+    live stream tag/format substituted. Raises OSError on a failed codec command."""
+    before = state(fd)
+    tag = stream_tag(fd)
+    live_fmt = fmt if fmt != 0x4013 else 0x4011
+    t0 = time.monotonic()
+    for item in hp:
+        if item[0] == 'coef':
+            coef_set(fd, item[1], item[2]); continue
+        _, n, v, p = item
+        if n == 0x02 and v == 0x200:
+            p = live_fmt
+        elif n == 0x02 and v == 0x706 and p:
+            p = tag
+        verb(fd, n, v, p)
+    # The macOS trace pulses GPIO4/5 (0x20,0x30,0x10,0x00): a pulse-coded command that
+    # shuts the external speaker amp down, and only the firmware (boot chime) powers it
+    # back up. Those writes are stripped from hp.verbs; just gate the amp with GPIO0.
+    verb(fd, 0x01, 0x715, 0x00)
+    verb(fd, 0x1d, 0x707, 0x00)          # speaker pin off (not in the macOS trace)
+    verb(fd, 0x10, 0x707, 0xc0)          # make sure HP pin is an output
+    # Note: vendor coef 0x1f stays 0 after this switch (as in the macOS trace) even though
+    # the headphones play, so it is not a usable success check. Errors raise OSError.
+    log(f'headphones on via macOS switch ({len(hp)} steps, {1000*(time.monotonic()-t0):.0f} ms); '
+        f'before: {before}; after: {state(fd)}')
+    return True
+
+SINK = 'alsa_output.pci-0000_00_1f.3.analog-stereo'
+CODEC_PM = '/sys/bus/hdaudio/devices/hdaudioC0D0/power/runtime_status'
+
+def pw_user():
+    for sock in glob.glob('/run/user/*/pipewire-0'):
+        uid = os.stat(sock).st_uid
+        return pwd.getpwuid(uid).pw_name, f'/run/user/{uid}'
+    return None, None
+
+CARD = 'alsa_card.pci-0000_00_1f.3'
+
+def pactl(user, rundir, *args, capture=False):
+    r = subprocess.run(['runuser', '-u', user, '--', 'env', f'XDG_RUNTIME_DIR={rundir}', 'pactl', *args],
+                       check=False, timeout=5, text=True,
+                       stdout=subprocess.PIPE if capture else subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return r.stdout or ''
+
+def active_profile(user, rundir):
+    card = False
+    for line in pactl(user, rundir, 'list', 'cards', capture=True).splitlines():
+        if line.strip().startswith('Name:'):
+            card = line.split(':', 1)[1].strip() == CARD
+        elif card and line.strip().startswith('Active Profile:'):
+            return line.split(':', 1)[1].strip()
+    return 'output:analog-stereo+input:analog-stereo'
+
+def stock_reinit():
+    """The speaker init leaves codec state that only the stock driver's full init clears,
+    and that runs when the codec resumes from runtime suspend. Suspending the sink is not
+    enough while a client streams, so switch the card profile off (closes every PCM), wait
+    for the codec to suspend, then restore the profile."""
+    user, rundir = pw_user()
+    if not user:
+        log('reinit: no PipeWire session found'); return
+    t0 = time.monotonic()
+    profile = active_profile(user, rundir)
+    pactl(user, rundir, 'set-card-profile', CARD, 'off')
+    end, ok = time.monotonic() + 4, False
+    while time.monotonic() < end:
+        try:
+            if open(CODEC_PM).read().strip() == 'suspended':
+                ok = True; break
+        except OSError:
+            pass
+        time.sleep(0.05)
+    pactl(user, rundir, 'set-card-profile', CARD, profile)
+    log(f'reinit: profile {profile} cycled, codec {"suspended+reinitialised" if ok else "DID NOT suspend"} '
+        f'({1000*(time.monotonic()-t0):.0f} ms gap)')
+
+# --- event sources -------------------------------------------------------------
+# 1) inotify IN_OPEN/IN_CLOSE on the playback PCM node: the codec stays powered (and
+#    keeps our settings) while the PCM is open, so we act once per open.
+# 2) ALSA control events on controlC0: the stock driver reports jack changes there.
+PCM_NODE = '/dev/snd/pcmC0D0p'
+CTL_NODE = '/dev/snd/controlC0'
+IN_OPEN, IN_CLOSE, IN_IGNORED = 0x20, 0x18, 0x8000
+CTL_SUBSCRIBE = 0xC0045516  # _IOWR('U', 0x16, int)
+libc = ctypes.CDLL(None, use_errno=True)
+
+def watch_pcm(ifd):
+    while libc.inotify_add_watch(ifd, PCM_NODE.encode(), IN_OPEN | IN_CLOSE) < 0:
+        time.sleep(1)  # device node missing (driver reload); wait for it to return
+
+def open_ctl():
+    fd = os.open(CTL_NODE, os.O_RDONLY | os.O_NONBLOCK)
+    fcntl.ioctl(fd, CTL_SUBSCRIBE, struct.pack('i', 1))
+    return fd
+
+def wait_running(timeout=2.0):
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if running():
+            return True
+        time.sleep(0.02)
+    return False
+
+def main():
+    setup, play = load(f'{SHARE}/setup.verbs'), load(f'{SHARE}/play.verbs')
+    hp = load_hp(f'{SHARE}/hp.verbs')
+    log(f'started (event-driven, macOS hp switch, reset fallback on error, {len(hp)} hp steps): {len(setup)} setup + {len(play)} play verbs')
+    ifd = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+    watch_pcm(ifd)
+    cfd = open_ctl()
+    poller = select.poll()
+    poller.register(ifd, select.POLLIN)
+    poller.register(cfd, select.POLLIN)
+    state = {'plugged': None, 'fmt': 0x4011}
+
+    def apply(reason):
+        if not wait_running():
+            return
+        with open(DEV, 'rb+', buffering=0) as fd:
+            plugged = bool(verb(fd, 0x10, GET_SENSE) & 0x80000000)
+            if not stream_tag(fd):
+                log('stream tag unknown (converters detached): falling back to stock re-init')
+                state['plugged'] = None
+                notag = True
+            else:
+                notag = False
+        if notag:
+            stock_reinit()
+            return
+        with open(DEV, 'rb+', buffering=0) as fd:
+            if reason == 'jack' and plugged == state['plugged']:
+                return
+            if plugged and state['plugged'] is False:
+                # speakers were initialised: try the macOS switch, else full stock re-init
+                try:
+                    headphones_macos(fd, hp, state['fmt'])
+                    state['plugged'] = True
+                    return
+                except OSError as e:
+                    log(f'macOS headphone switch failed ({e})')
+            elif plugged:
+                headphones(fd, state['fmt']); state['plugged'] = True
+                return
+            else:
+                state['fmt'] = speakers(fd, setup, play); state['plugged'] = False
+                return
+        # plugged in while the speaker init is active
+        state['plugged'] = None
+        log('fallback: forcing stock re-init via card profile cycle')
+        stock_reinit()
+
+    if running():
+        apply('startup')
+    while True:
+        for fd, _ in poller.poll():
+            try:
+                if fd == ifd:
+                    buf = os.read(ifd, 4096)
+                    opened = False
+                    for off in range(0, len(buf), 16):
+                        mask = struct.unpack_from('iIII', buf, off)[1]
+                        if mask & IN_IGNORED:
+                            watch_pcm(ifd)
+                        if mask & IN_OPEN:
+                            opened = True
+                        if mask & IN_CLOSE:
+                            state['plugged'] = None
+                            globals()['LAST_TAG'] = 0
+                    if opened:
+                        apply('open')
+                else:
+                    while True:
+                        try:
+                            os.read(cfd, 4096)
+                        except BlockingIOError:
+                            break
+                    if running():
+                        apply('jack')
+            except OSError as e:
+                log(f'error: {e}')
+                if fd == cfd:
+                    poller.unregister(cfd)
+                    time.sleep(1)
+                    cfd = open_ctl(); poller.register(cfd, select.POLLIN)
+
+if __name__ == '__main__':
+    main()

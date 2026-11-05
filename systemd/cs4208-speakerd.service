@@ -1,0 +1,11 @@
+[Unit]
+Description=MacBook10,1 CS4208 internal speaker enabler (stock driver + macOS amp init)
+After=sound.target
+
+[Service]
+ExecStart=/usr/local/sbin/cs4208-speakerd
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
